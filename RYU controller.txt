@@ -1,0 +1,148 @@
+import signal
+import pandas as pd
+import numpy as np
+import time
+import matplotlib.pyplot as plt
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import MAIN_DISPATCHER, set_ev_cls
+from ryu.lib.packet import packet
+from ryu.lib.packet import ethernet, ipv4, tcp
+from ryu.ofproto import ofproto_v1_3
+from sklearn.ensemble import IsolationForest
+
+class HttpHeaderCapture(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    def _init_(self, *args, **kwargs):
+        super(HttpHeaderCapture, self)._init_(*args, **kwargs)
+        self.headers_data = pd.read_csv("myDS.csv")
+        self.headers_data.dropna(inplace=True)
+        self.headers_data = self.headers_data.sample(frac=1).reset_index(drop=True)  # Shuffle the data
+
+        self.feature_columns = ['Flow Duration', 'Total Fwd Packets', 'Total Backward Packets',
+                                 'Total Length of Fwd Packets', 'Total Length of Bwd Packets',
+                                 'Flow Bytes/s', 'Flow Packets/s', 'Flow IAT Mean',
+                                 'Flow IAT Std', 'Flow IAT Max', 'Flow IAT Min',
+                                 'Fwd IAT Total', 'Fwd IAT Mean', 'Fwd IAT Std',
+                                 'Fwd IAT Max', 'Fwd IAT Min', 'Bwd IAT Total',
+                                 'Bwd IAT Mean', 'Bwd IAT Std', 'Bwd IAT Max',
+                                 'Bwd IAT Min', 'Active Mean', 'Active Std',
+                                 'Active Max', 'Active Min', 'Idle Mean', 'Idle Std',
+                                 'Idle Max', 'Idle Min']
+
+        self.headers_features = self.headers_data[self.feature_columns]
+
+        self.isolation_forest = IsolationForest(contamination=0.1)  # Adjust contamination value as per your needs
+        self.isolation_forest.fit(self.headers_features.values)
+	# Initialize variables to collect statistics
+        self.num_anomalies_detected = 0
+        self.num_packets_processed = 0
+
+        # Lists to store data for plotting
+        self.timestamps = []  # Timestamps for each data point
+        self.packet_counts = []  # Number of packets processed at each timestamp
+
+        # Set up the signal handler for KeyboardInterrupt (Ctrl+C) after method definition
+        signal.signal(signal.SIGINT, self.print_statistics_and_exit)
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+
+        pkt = packet.Packet(data=msg.data)
+        eth = pkt.get_protocol(ethernet.ethernet)
+        ip = pkt.get_protocol(ipv4.ipv4)
+        tp = pkt.get_protocol(tcp.tcp)
+
+        if tp and tp.dst_port == 80:
+            headers = self.extract_http_headers(pkt)
+            if self.is_anomaly(headers):
+                print("Anomaly Detected in HTTP Headers!")
+
+        # Introduce inefficiency: Sleep for a short time for every packet processed
+        time.sleep(0.01)  # Sleep for 10 milliseconds
+
+        out_port = ofproto.OFPP_FLOOD
+        actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+
+        # Install a flow to avoid packet_in next time
+        if out_port != ofproto.OFPP_FLOOD:
+            match = datapath.ofproto_parser.OFPMatch(
+	 in_port=msg.match['in_port'], eth_dst=eth.dst)
+            self.add_flow(datapath, 1, match, actions)
+
+        # Capture timestamp and packet count for plotting
+        self.timestamps.append(time.time())
+        self.packet_counts.append(self.num_packets_processed)
+
+    def add_flow(self, datapath, priority, match, actions):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                             actions)]
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                match=match, instructions=inst)
+        datapath.send_msg(mod)
+
+    @staticmethod
+    def extract_http_headers(pkt):
+        headers = {}
+        for p in pkt.protocols:
+            if isinstance(p, tcp.tcp):
+                if p.src_port == 80:
+                    header_lines = p.data.split(b'\r\n')
+                    for line in header_lines:
+                        if b':' in line:
+                            key, value = line.split(b':', 1)
+                            headers[key.decode()] = value.decode().strip()
+        return headers
+
+    def is_anomaly(self, headers):
+        headers_df = pd.DataFrame([headers])
+        headers_df = headers_df.reindex(columns=self.feature_columns, fill_value=0)
+        headers_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        headers_df.fillna(0, inplace=True)
+	# Update statistics
+        self.num_packets_processed += 1
+        score = self.isolation_forest.decision_function(headers_df.values)
+        print("Score of this packet is ",score[0])
+        if score[0] < 0:
+            self.num_anomalies_detected += 1
+            return True
+        return False
+
+    def print_statistics_and_exit(self, signum, frame):
+    	# Calculate detection rate and speed
+    	detection_rate = self.num_anomalies_detected / self.num_packets_processed
+    	detection_speed = self.num_anomalies_detected / self.headers_data.shape[0]
+
+    	# Calculate accuracy as the complement of the detection rate (i.e., 100% - detection rate)
+    	accuracy = 100.0 - (detection_rate * 100.0)
+
+    	# Convert timestamps to milliseconds
+    	timestamps_ms = [ts * 1000 for ts in self.timestamps]
+
+    	# Create and display the time series plot with time in milliseconds
+    	plt.figure(figsize=(10, 6))
+    	plt.plot(timestamps_ms, self.packet_counts, label="Packets Processed")
+    	plt.xlabel("Time (milliseconds)")
+    	plt.ylabel("Number of Packets Processed")
+    	plt.title("Packet Processing Over Time")
+    	plt.legend()
+    	plt.grid(True)
+    	plt.show()
+
+    	# Print accuracy
+    	print("Accuracy: {:.2f}%".format(accuracy))
+
+    	# Stop the Ryu controller gracefully
+    	self.close()
+	
+	if _name_ == '_main_':
+    from ryu.cmd import manager
+    manager.main()
+
